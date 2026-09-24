@@ -1,4 +1,4 @@
-USE CGM;
+conect youUSE CGM;
 GO
 
 /* =========================================================
@@ -25,7 +25,8 @@ CREATE TABLE dbo.Users
     -- Apple's unique user identifier
     AppleSubjectId      NVARCHAR(255) NULL,
 
-    ProfilePictureUrl   NVARCHAR(1000) NULL,
+    LastLoginDeviceId   NVARCHAR(255) NULL,
+    LastLoginDeviceInfo NVARCHAR(255) NULL,
 
     EmailVerified       BIT NOT NULL DEFAULT 0,
     IsActive            BIT NOT NULL DEFAULT 1,
@@ -33,7 +34,8 @@ CREATE TABLE dbo.Users
     LastLoginAt         DATETIME2 NULL,
 
     CreatedAt           DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
-    UpdatedAt           DATETIME2 NULL
+    UpdatedAt           DATETIME2 NULL,
+    TokenVersion        INT NOT NULL DEFAULT 0
 );
 GO
 
@@ -192,18 +194,12 @@ CREATE TABLE dbo.Sensors
     StartedAt           DATETIME2 NULL,
     ActivatedAt         DATETIME2 NULL,
 
-    -- Only populate when vendor/product rule provides it
-    ExpiresAt           DATETIME2 NULL,
-
     LastReadingAt       DATETIME2 NULL,
 
     -- Latest measurement SN received from this sensor
     LatestSequenceNumber INT NULL,
 
     IsActive            BIT NOT NULL DEFAULT 1,
-
-    CreatedAt           DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
-    UpdatedAt           DATETIME2 NULL,
 
     CONSTRAINT FK_Sensors_User
         FOREIGN KEY (UserId)
@@ -233,30 +229,13 @@ GO
 
 CREATE TABLE dbo.GlucoseMeasurements
 (
-    Id                  BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
-
     UserId              INT NOT NULL,
     SensorId            INT NOT NULL,
-
-    -- SN from CGM protocol
-    SequenceNumber      INT NOT NULL,
 
     -- Final glucose value
     GlucoseValue        DECIMAL(10,2) NULL,
 
-    -- mg/dL or mmol/L
-    GlucoseUnit         NVARCHAR(10) NULL,
-
     MeasurementTime     DATETIME2 NOT NULL,
-
-    -- Example:
-    -- Rising
-    -- Stable
-    -- Falling
-    Trend               NVARCHAR(30) NULL,
-
-    -- Low / InRange / High
-    GlucoseStatus       NVARCHAR(30) NULL,
 
     /* Raw CGM values.
        Useful for diagnostic/R&D purposes.
@@ -279,15 +258,12 @@ CREATE TABLE dbo.GlucoseMeasurements
 
     CONSTRAINT FK_GlucoseMeasurements_Sensor
         FOREIGN KEY (SensorId)
-        REFERENCES dbo.Sensors(Id)
+        REFERENCES dbo.Sensors(Id),
+
+    CONSTRAINT PK_GlucoseMeasurements PRIMARY KEY (SensorId, MeasurementTime)
 );
 GO
 
-
-/* A particular SN should appear once per sensor */
-CREATE UNIQUE INDEX UX_GlucoseMeasurements_Sensor_SN
-ON dbo.GlucoseMeasurements(SensorId, SequenceNumber);
-GO
 
 
 /* Very important for graphs/history */
@@ -295,10 +271,6 @@ CREATE INDEX IX_GlucoseMeasurements_User_Time
 ON dbo.GlucoseMeasurements(UserId, MeasurementTime DESC);
 GO
 
-
-CREATE INDEX IX_GlucoseMeasurements_Sensor_Time
-ON dbo.GlucoseMeasurements(SensorId, MeasurementTime DESC);
-GO
 
 
 
@@ -314,7 +286,6 @@ CREATE TABLE dbo.Alerts
     UserId              INT NOT NULL,
 
     SensorId            INT NULL,
-    MeasurementId       BIGINT NULL,
 
     -- LowGlucose
     -- HighGlucose
@@ -350,11 +321,7 @@ CREATE TABLE dbo.Alerts
 
     CONSTRAINT FK_Alerts_Sensor
         FOREIGN KEY (SensorId)
-        REFERENCES dbo.Sensors(Id),
-
-    CONSTRAINT FK_Alerts_Measurement
-        FOREIGN KEY (MeasurementId)
-        REFERENCES dbo.GlucoseMeasurements(Id)
+        REFERENCES dbo.Sensors(Id)
 );
 GO
 
@@ -368,50 +335,6 @@ CREATE INDEX IX_Alerts_User_Read
 ON dbo.Alerts(UserId, IsRead);
 GO
 
-
-
-/* =========================================================
-   7. REFRESH TOKENS
-   Used with JWT authentication
-   ========================================================= */
-
-CREATE TABLE dbo.RefreshTokens
-(
-    Id                  BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
-
-    UserId              INT NOT NULL,
-
-    -- Store HASH of token, not plain refresh token
-    TokenHash           NVARCHAR(500) NOT NULL,
-
-    ExpiresAt           DATETIME2 NOT NULL,
-
-    CreatedAt           DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
-
-    RevokedAt           DATETIME2 NULL,
-
-    IsRevoked           BIT NOT NULL DEFAULT 0,
-
-    ReplacedByTokenHash NVARCHAR(500) NULL,
-
-    DeviceInfo          NVARCHAR(500) NULL,
-    IpAddress           NVARCHAR(100) NULL,
-
-    CONSTRAINT FK_RefreshTokens_User
-        FOREIGN KEY (UserId)
-        REFERENCES dbo.Users(Id)
-);
-GO
-
-
-CREATE INDEX IX_RefreshTokens_UserId
-ON dbo.RefreshTokens(UserId);
-GO
-
-
-CREATE UNIQUE INDEX UX_RefreshTokens_TokenHash
-ON dbo.RefreshTokens(TokenHash);
-GO
 
 
 /* =========================================================
@@ -466,5 +389,4 @@ BEGIN
     VALUES (@NewUserId, 'mg/dL', 'English', 'System', 1, SYSUTCDATETIME());
 END;
 GO
-
 

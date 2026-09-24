@@ -15,11 +15,17 @@ public class CgmDbContext : DbContext
     public DbSet<SensorEntity> Sensors => Set<SensorEntity>();
     public DbSet<GlucoseMeasurementEntity> GlucoseMeasurements => Set<GlucoseMeasurementEntity>();
     public DbSet<AlertEntity> Alerts => Set<AlertEntity>();
-    public DbSet<RefreshTokenEntity> RefreshTokens => Set<RefreshTokenEntity>();
     public DbSet<PasswordResetTokenEntity> PasswordResetTokens => Set<PasswordResetTokenEntity>();
     public DbSet<FamilyEntity> Families => Set<FamilyEntity>();
     public DbSet<FamilyMemberEntity> FamilyMembers => Set<FamilyMemberEntity>();
     public DbSet<AlertRecipientEntity> AlertRecipients => Set<AlertRecipientEntity>();
+    public DbSet<AuditLogEntity> AuditLogs => Set<AuditLogEntity>();
+    public DbSet<AlertHistoryEntity> AlertHistory => Set<AlertHistoryEntity>();
+    public DbSet<DailyGlucoseSummaryEntity> DailyGlucoseSummaries => Set<DailyGlucoseSummaryEntity>();
+    public DbSet<AlertRuleEntity> AlertRules => Set<AlertRuleEntity>();
+    public DbSet<AlertQueueEntity> AlertQueue => Set<AlertQueueEntity>();
+    public DbSet<AlertDeliveryHistoryEntity> AlertDeliveryHistory => Set<AlertDeliveryHistoryEntity>();
+    public DbSet<NotificationEndpointEntity> NotificationEndpoints => Set<NotificationEndpointEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -82,9 +88,9 @@ public class CgmDbContext : DbContext
         modelBuilder.Entity<GlucoseMeasurementEntity>(entity =>
         {
             entity.ToTable("GlucoseMeasurements", "dbo");
-            entity.HasIndex(e => new { e.SensorId, e.SequenceNumber }).IsUnique().HasDatabaseName("UX_GlucoseMeasurements_Sensor_SN");
+            entity.HasKey(e => new { e.SensorId, e.MeasurementTime });
             entity.HasIndex(e => new { e.UserId, e.MeasurementTime }).HasDatabaseName("IX_GlucoseMeasurements_User_Time");
-            entity.HasIndex(e => new { e.SensorId, e.MeasurementTime }).HasDatabaseName("IX_GlucoseMeasurements_Sensor_Time");
+            entity.HasIndex(e => new { e.DeviceId, e.MeasurementTime }).HasDatabaseName("IX_GlucoseMeasurements_Device_Time");
 
             entity.HasOne(e => e.User)
                   .WithMany(u => u.Measurements)
@@ -95,6 +101,29 @@ public class CgmDbContext : DbContext
                   .WithMany(s => s.Measurements)
                   .HasForeignKey(e => e.SensorId)
                   .OnDelete(DeleteBehavior.Restrict);
+
+            entity.HasOne(e => e.Device)
+                  .WithMany(d => d.Measurements)
+                  .HasForeignKey(e => e.DeviceId)
+                  .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<AuditLogEntity>(entity =>
+        {
+            entity.HasIndex(e => new { e.UserId, e.CreatedAt }).HasDatabaseName("IX_AuditLogs_User_CreatedAt");
+            entity.HasIndex(e => new { e.Entity, e.EntityId }).HasDatabaseName("IX_AuditLogs_Entity_EntityId");
+        });
+
+        modelBuilder.Entity<AlertHistoryEntity>(entity =>
+        {
+            entity.HasIndex(e => new { e.UserId, e.TriggeredAt }).HasDatabaseName("IX_AlertHistory_User_TriggeredAt");
+            entity.HasOne(e => e.Alert).WithMany().HasForeignKey(e => e.AlertId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<DailyGlucoseSummaryEntity>(entity =>
+        {
+            entity.HasIndex(e => new { e.UserId, e.SummaryDate }).IsUnique()
+                .HasDatabaseName("UX_DailyGlucoseSummaries_User_Date");
         });
 
         // 6. Alerts
@@ -113,30 +142,30 @@ public class CgmDbContext : DbContext
                   .WithMany(s => s.Alerts)
                   .HasForeignKey(e => e.SensorId)
                   .OnDelete(DeleteBehavior.SetNull);
-
-            entity.HasOne(e => e.Measurement)
-                  .WithMany()
-                  .HasForeignKey(e => e.MeasurementId)
-                  .OnDelete(DeleteBehavior.SetNull);
         });
 
-        // 7. RefreshTokens
-        modelBuilder.Entity<RefreshTokenEntity>(entity =>
+        modelBuilder.Entity<AlertRuleEntity>(entity =>
         {
-            entity.ToTable("RefreshTokens", "dbo");
-            entity.HasIndex(e => e.UserId).HasDatabaseName("IX_RefreshTokens_UserId");
-            entity.HasIndex(e => e.TokenHash).IsUnique().HasDatabaseName("UX_RefreshTokens_TokenHash");
-
-            entity.HasOne(e => e.User)
-                  .WithMany(u => u.RefreshTokens)
-                  .HasForeignKey(e => e.UserId)
-                  .OnDelete(DeleteBehavior.Cascade);
+            entity.HasIndex(e => new { e.UserId, e.AlertType, e.Enabled }).HasDatabaseName("IX_AlertRules_User_Type_Enabled");
+        });
+        modelBuilder.Entity<AlertQueueEntity>(entity =>
+        {
+            entity.HasIndex(e => new { e.Status, e.NextAttemptAt }).HasDatabaseName("IX_AlertQueue_Status_NextAttempt");
+            entity.HasOne(e => e.Alert).WithMany().HasForeignKey(e => e.AlertId).OnDelete(DeleteBehavior.Cascade);
+        });
+        modelBuilder.Entity<AlertDeliveryHistoryEntity>(entity =>
+        {
+            entity.HasIndex(e => new { e.AlertId, e.Channel }).HasDatabaseName("IX_AlertDeliveryHistory_Alert_Channel");
+        });
+        modelBuilder.Entity<NotificationEndpointEntity>(entity =>
+        {
+            entity.HasIndex(e => new { e.UserId, e.Channel, e.Address }).IsUnique().HasDatabaseName("UX_NotificationEndpoints_User_Channel_Address");
         });
 
         // 8. PasswordResetTokens
         modelBuilder.Entity<PasswordResetTokenEntity>(entity =>
         {
-            entity.ToTable("PasswordResetTokens", "dbo");
+            entity.ToTable("PasswordResetRequests", "dbo");
             entity.HasIndex(e => e.Email).HasDatabaseName("IX_PasswordResetTokens_Email");
             entity.HasIndex(e => e.Token).HasDatabaseName("IX_PasswordResetTokens_Token");
             entity.HasIndex(e => new { e.Email, e.OtpCode, e.IsUsed }).HasDatabaseName("IX_PasswordResetTokens_Email_Otp");
@@ -168,5 +197,6 @@ public class CgmDbContext : DbContext
             entity.HasOne(e => e.Alert).WithMany(a => a.Recipients).HasForeignKey(e => e.AlertId).OnDelete(DeleteBehavior.Cascade);
             entity.HasOne(e => e.User).WithMany(u => u.AlertRecipients).HasForeignKey(e => e.UserId).OnDelete(DeleteBehavior.Restrict);
         });
+
     }
 }

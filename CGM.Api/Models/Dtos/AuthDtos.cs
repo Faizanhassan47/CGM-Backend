@@ -14,14 +14,20 @@ public record LoginRequestDto(
     [Required, EmailAddress] string Email,
     [Required] string Password,
     bool RememberMe = false,
-    string? DeviceInfo = null
+    string? DeviceInfo = null,
+    string? DeviceId = null,
+    string? DeviceName = null,
+    string? Platform = null
 );
 
 public record SocialAuthRequestDto(
     [Required] string IdToken,
     [Required] string Provider, // Google / Apple
     string? FullName,
-    string? DeviceInfo
+    string? DeviceInfo,
+    string? DeviceId = null,
+    string? DeviceName = null,
+    string? Platform = null
 );
 
 public record RefreshTokenRequestDto(
@@ -45,7 +51,6 @@ public record UserDto(
     bool EmailVerified,
     bool ProfileCompleted,
     string PreferredGlucoseUnit,
-    string? ProfilePictureUrl,
     string? ReferralCode
 );
 
@@ -72,6 +77,15 @@ public record ChangePasswordRequestDto(
 public record ResetPasswordResponseDto(
     bool Success,
     string Message
+);
+
+public record VerifyEmailRequestDto(
+    [Required, EmailAddress] string Email,
+    [Required, StringLength(6, MinimumLength = 6)] string Code
+);
+
+public record ResendVerificationRequestDto(
+    [Required, EmailAddress] string Email
 );
 
 public record PatientProfileDto(

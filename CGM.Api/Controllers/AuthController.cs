@@ -9,6 +9,7 @@ using CGM.Api.Models.Dtos;
 using CGM.Api.Models.Entities;
 using CGM.Api.Services;
 using CGM.Api.Services.Email;
+using Google.Apis.Auth;
 
 namespace CGM.Api.Controllers;
 
@@ -22,19 +23,103 @@ public class AuthController : ControllerBase
     private readonly ITokenService _tokenService;
     private readonly IEmailService _emailService;
     private readonly IReferralCodeService _referralCodes;
+    private readonly IConfiguration _configuration;
 
     public AuthController(
         CgmDbContext db,
         IPasswordHasher passwordHasher,
         ITokenService tokenService,
         IEmailService emailService,
-        IReferralCodeService referralCodes)
+        IReferralCodeService referralCodes,
+        IConfiguration configuration)
     {
         _db = db;
         _passwordHasher = passwordHasher;
         _tokenService = tokenService;
         _emailService = emailService;
         _referralCodes = referralCodes;
+        _configuration = configuration;
+    }
+
+    [HttpPost("social")]
+    public async Task<ActionResult<AuthResponseDto>> SocialLogin([FromBody] SocialAuthRequestDto request)
+    {
+        if (!string.Equals(request.Provider, "Google", StringComparison.OrdinalIgnoreCase))
+            return BadRequest(new AuthResponseDto(false, "This social provider is not supported.", null, null, null, null));
+
+        var clientId = _configuration["GoogleAuthentication:ClientId"];
+        if (string.IsNullOrWhiteSpace(clientId))
+            return StatusCode(503, new AuthResponseDto(false, "Google authentication is not configured.", null, null, null, null));
+
+        GoogleJsonWebSignature.Payload google;
+        try
+        {
+            google = await GoogleJsonWebSignature.ValidateAsync(request.IdToken,
+                new GoogleJsonWebSignature.ValidationSettings { Audience = [clientId] });
+        }
+        catch (Exception)
+        {
+            return Unauthorized(new AuthResponseDto(false, "The Google sign-in token is invalid or expired.", null, null, null, null));
+        }
+
+        if (string.IsNullOrWhiteSpace(google.Subject) || string.IsNullOrWhiteSpace(google.Email) || google.EmailVerified != true)
+            return Unauthorized(new AuthResponseDto(false, "Google did not provide a verified email address.", null, null, null, null));
+
+        var email = google.Email.Trim().ToLowerInvariant();
+        var user = await _db.Users.Include(u => u.Profile)
+            .FirstOrDefaultAsync(u => u.GoogleSubjectId == google.Subject || u.Email == email);
+
+        if (user is null)
+        {
+            user = new User
+            {
+                FullName = string.IsNullOrWhiteSpace(google.Name) ? email.Split('@')[0] : google.Name.Trim(),
+                Email = email,
+                AuthProvider = "Google",
+                GoogleSubjectId = google.Subject,
+                EmailVerified = true,
+                IsActive = true,
+                CreatedAt = DateTime.UtcNow,
+                LastLoginAt = DateTime.UtcNow,
+                Profile = new PatientProfileEntity
+                {
+                    PreferredGlucoseUnit = "mg/dL",
+                    Language = "English",
+                    Theme = "System",
+                    ProfileCompleted = false,
+                    CreatedAt = DateTime.UtcNow
+                }
+            };
+            user.ReferralCode = await _referralCodes.GenerateUniqueAsync(HttpContext.RequestAborted);
+            _db.Users.Add(user);
+        }
+        else
+        {
+            if (!user.IsActive)
+                return Unauthorized(new AuthResponseDto(false, "This account is inactive.", null, null, null, null));
+            if (!string.IsNullOrWhiteSpace(user.GoogleSubjectId) && user.GoogleSubjectId != google.Subject)
+                return Conflict(new AuthResponseDto(false, "This email is linked to another Google account.", null, null, null, null));
+
+            user.GoogleSubjectId = google.Subject;
+            user.EmailVerified = true;
+            user.LastLoginAt = DateTime.UtcNow;
+            user.UpdatedAt = DateTime.UtcNow;
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.DeviceId))
+            user.LastLoginDeviceId = request.DeviceId;
+        if (!string.IsNullOrWhiteSpace(request.DeviceInfo))
+            user.LastLoginDeviceInfo = request.DeviceInfo;
+
+        await _db.SaveChangesAsync();
+
+        var (accessToken, expiresAt) = _tokenService.GenerateAccessToken(user, request.DeviceId);
+        var (rawRefreshToken, _) = _tokenService.GenerateRefreshToken(user, request.DeviceId);
+
+        var userDto = new UserDto(user.Id, user.FullName, user.Email, user.AuthProvider,
+            user.EmailVerified, user.Profile?.ProfileCompleted ?? false,
+            user.Profile?.PreferredGlucoseUnit ?? "mg/dL", user.ReferralCode);
+        return Ok(new AuthResponseDto(true, "Signed in with Google.", accessToken, rawRefreshToken, expiresAt, userDto));
     }
 
     [HttpPost("register")]
@@ -51,7 +136,7 @@ public class AuthController : ControllerBase
             Email = request.Email.Trim().ToLower(),
             PasswordHash = _passwordHasher.HashPassword(request.Password),
             AuthProvider = "Email",
-            EmailVerified = false,
+            EmailVerified = true,
             IsActive = true,
             CreatedAt = DateTime.UtcNow
         };
@@ -80,27 +165,14 @@ public class AuthController : ControllerBase
             }
         }
 
-        // Send Welcome Email asynchronously
+        // Send Welcome email in background without blocking
         _ = Task.Run(async () =>
         {
-            try
-            {
-                await _emailService.SendWelcomeEmailAsync(user.Email, user.FullName);
-            }
-            catch { /* Ignore background email failures */ }
+            try { await _emailService.SendWelcomeEmailAsync(user.Email, user.FullName); } catch { }
         });
 
         var (accessToken, expiresAt) = _tokenService.GenerateAccessToken(user);
-        var (rawRefreshToken, tokenHash, refreshExpiresAt) = _tokenService.GenerateRefreshToken();
-
-        _db.RefreshTokens.Add(new RefreshTokenEntity
-        {
-            UserId = user.Id,
-            TokenHash = tokenHash,
-            ExpiresAt = refreshExpiresAt,
-            CreatedAt = DateTime.UtcNow
-        });
-        await _db.SaveChangesAsync();
+        var (rawRefreshToken, _) = _tokenService.GenerateRefreshToken(user);
 
         var userDto = new UserDto(
             user.Id,
@@ -110,12 +182,14 @@ public class AuthController : ControllerBase
             user.EmailVerified,
             profile.ProfileCompleted,
             profile.PreferredGlucoseUnit,
-            user.ProfilePictureUrl,
             user.ReferralCode
         );
 
-        return Ok(new AuthResponseDto(true, "Registration successful.", accessToken, rawRefreshToken, expiresAt, userDto));
+        var message = "Account created successfully.";
+        return Ok(new AuthResponseDto(true, message, accessToken, rawRefreshToken, expiresAt, userDto));
     }
+
+
 
     [HttpPost("login")]
     public async Task<ActionResult<AuthResponseDto>> Login([FromBody] LoginRequestDto request)
@@ -135,18 +209,13 @@ public class AuthController : ControllerBase
         }
 
         user.LastLoginAt = DateTime.UtcNow;
+        if (!string.IsNullOrWhiteSpace(request.DeviceId))
+            user.LastLoginDeviceId = request.DeviceId;
+        if (!string.IsNullOrWhiteSpace(request.DeviceInfo))
+            user.LastLoginDeviceInfo = request.DeviceInfo;
 
-        var (accessToken, expiresAt) = _tokenService.GenerateAccessToken(user);
-        var (rawRefreshToken, tokenHash, refreshExpiresAt) = _tokenService.GenerateRefreshToken();
-
-        _db.RefreshTokens.Add(new RefreshTokenEntity
-        {
-            UserId = user.Id,
-            TokenHash = tokenHash,
-            ExpiresAt = refreshExpiresAt,
-            DeviceInfo = request.DeviceInfo,
-            CreatedAt = DateTime.UtcNow
-        });
+        var (accessToken, expiresAt) = _tokenService.GenerateAccessToken(user, request.DeviceId);
+        var (rawRefreshToken, _) = _tokenService.GenerateRefreshToken(user, request.DeviceId);
         await _db.SaveChangesAsync();
 
         var userDto = new UserDto(
@@ -157,7 +226,6 @@ public class AuthController : ControllerBase
             user.EmailVerified,
             user.Profile?.ProfileCompleted ?? false,
             user.Profile?.PreferredGlucoseUnit ?? "mg/dL",
-            user.ProfilePictureUrl,
             user.ReferralCode
         );
 
@@ -171,9 +239,7 @@ public class AuthController : ControllerBase
         var user = await _db.Users.FirstOrDefaultAsync(u => u.Email.ToLower() == email);
 
         if (user == null)
-        {
-            return NotFound(new ResetPasswordResponseDto(false, "No account found with this email address. Please check your email or sign up."));
-        }
+            return Ok(new ResetPasswordResponseDto(true, "If an account exists, password reset instructions have been sent."));
 
         // Invalidate any existing unused reset tokens for this email
         var existingTokens = await _db.PasswordResetTokens
@@ -194,8 +260,8 @@ public class AuthController : ControllerBase
         {
             UserId = user.Id,
             Email = email,
-            Token = token,
-            OtpCode = otpCode,
+            Token = _tokenService.HashToken(token),
+            OtpCode = _tokenService.HashToken(otpCode),
             ExpiresAt = expiresAt,
             IsUsed = false,
             CreatedAt = DateTime.UtcNow
@@ -204,15 +270,21 @@ public class AuthController : ControllerBase
         _db.PasswordResetTokens.Add(resetEntity);
         await _db.SaveChangesAsync();
 
-        // Send Email via SMTP
-        var sent = await _emailService.SendPasswordResetEmailAsync(user.Email, user.FullName, token, otpCode, expiresAt);
+        // Send Email via SMTP in background so mobile app responds immediately (<50ms)
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _emailService.SendPasswordResetEmailAsync(user.Email, user.FullName, token, otpCode, expiresAt);
+            }
+            catch (Exception)
+            {
+                // Suppress exception; logged inside EmailService
+            }
+        });
 
-        return Ok(new ResetPasswordResponseDto(
-            true,
-            sent 
-                ? "A 6-digit reset code has been sent to your email address. It will expire in 15 minutes."
-                : "Reset code generated. (Email dispatched with 15-minute validity)."
-        ));
+        return Ok(new ResetPasswordResponseDto(true,
+            "If an account exists, password reset instructions have been sent."));
     }
 
     [HttpPost("verify-reset-code")]
@@ -220,10 +292,11 @@ public class AuthController : ControllerBase
     {
         var email = request.Email.Trim().ToLower();
         var code = request.Code.Trim();
+        var codeHash = _tokenService.HashToken(code);
 
         var tokenEntity = await _db.PasswordResetTokens
             .OrderByDescending(t => t.CreatedAt)
-            .FirstOrDefaultAsync(t => t.Email.ToLower() == email && t.OtpCode == code && !t.IsUsed);
+            .FirstOrDefaultAsync(t => t.Email.ToLower() == email && (t.OtpCode == codeHash || t.OtpCode == code) && !t.IsUsed);
 
         if (tokenEntity == null)
         {
@@ -243,10 +316,11 @@ public class AuthController : ControllerBase
     {
         var email = request.Email.Trim().ToLower();
         var tokenOrCode = request.TokenOrCode.Trim();
+        var tokenHash = _tokenService.HashToken(tokenOrCode);
 
         var tokenEntity = await _db.PasswordResetTokens
             .OrderByDescending(t => t.CreatedAt)
-            .FirstOrDefaultAsync(t => t.Email.ToLower() == email && (t.Token == tokenOrCode || t.OtpCode == tokenOrCode) && !t.IsUsed);
+            .FirstOrDefaultAsync(t => t.Email.ToLower() == email && (t.Token == tokenHash || t.OtpCode == tokenHash || t.OtpCode == tokenOrCode || t.Token == tokenOrCode) && !t.IsUsed);
 
         if (tokenEntity == null)
         {
@@ -268,12 +342,7 @@ public class AuthController : ControllerBase
         user.PasswordHash = _passwordHasher.HashPassword(request.NewPassword);
         user.UpdatedAt = DateTime.UtcNow;
 
-        var activeSessions = await _db.RefreshTokens.Where(t => t.UserId == user.Id && !t.IsRevoked).ToListAsync();
-        foreach (var session in activeSessions)
-        {
-            session.IsRevoked = true;
-            session.RevokedAt = DateTime.UtcNow;
-        }
+        user.TokenVersion++;
 
         // Invalidate token
         tokenEntity.IsUsed = true;
@@ -287,46 +356,21 @@ public class AuthController : ControllerBase
     [HttpPost("refresh-token")]
     public async Task<ActionResult<AuthResponseDto>> RefreshToken([FromBody] RefreshTokenRequestDto request)
     {
-        var tokenHash = _tokenService.HashToken(request.RefreshToken);
-        var storedToken = await _db.RefreshTokens
-            .Include(r => r.User)
-            .ThenInclude(u => u.Profile)
-            .FirstOrDefaultAsync(r => r.TokenHash == tokenHash);
-
-        if (storedToken?.IsRevoked == true && !string.IsNullOrEmpty(storedToken.ReplacedByTokenHash))
-        {
-            var sessions = await _db.RefreshTokens.Where(t => t.UserId == storedToken.UserId && !t.IsRevoked).ToListAsync();
-            foreach (var session in sessions)
-            {
-                session.IsRevoked = true;
-                session.RevokedAt = DateTime.UtcNow;
-            }
-            await _db.SaveChangesAsync();
-        }
-
-        if (storedToken == null || storedToken.IsRevoked || storedToken.ExpiresAt < DateTime.UtcNow)
+        var principal = _tokenService.ValidateRefreshToken(request.RefreshToken);
+        var userIdClaim = principal?.FindFirstValue(ClaimTypes.NameIdentifier) ?? principal?.FindFirstValue("sub");
+        var versionClaim = principal?.FindFirstValue("token_version");
+        if (!int.TryParse(userIdClaim, out var userId) || !int.TryParse(versionClaim, out var tokenVersion))
         {
             return Unauthorized(new AuthResponseDto(false, "Invalid or expired refresh token.", null, null, null, null));
         }
 
-        // Revoke old token & replace
-        storedToken.IsRevoked = true;
-        storedToken.RevokedAt = DateTime.UtcNow;
+        var user = await _db.Users.Include(u => u.Profile)
+            .FirstOrDefaultAsync(u => u.Id == userId && u.IsActive);
+        if (user is null || user.TokenVersion != tokenVersion)
+            return Unauthorized(new AuthResponseDto(false, "Invalid or expired refresh token.", null, null, null, null));
 
-        var user = storedToken.User;
-        var (accessToken, expiresAt) = _tokenService.GenerateAccessToken(user);
-        var (newRawRefreshToken, newTokenHash, refreshExpiresAt) = _tokenService.GenerateRefreshToken();
-
-        storedToken.ReplacedByTokenHash = newTokenHash;
-
-        _db.RefreshTokens.Add(new RefreshTokenEntity
-        {
-            UserId = user.Id,
-            TokenHash = newTokenHash,
-            ExpiresAt = refreshExpiresAt,
-            CreatedAt = DateTime.UtcNow
-        });
-        await _db.SaveChangesAsync();
+        var deviceId = principal?.FindFirstValue("device_id");
+        var (accessToken, expiresAt) = _tokenService.GenerateAccessToken(user, deviceId);
 
         var userDto = new UserDto(
             user.Id,
@@ -336,25 +380,28 @@ public class AuthController : ControllerBase
             user.EmailVerified,
             user.Profile?.ProfileCompleted ?? false,
             user.Profile?.PreferredGlucoseUnit ?? "mg/dL",
-            user.ProfilePictureUrl,
             user.ReferralCode
         );
 
-        return Ok(new AuthResponseDto(true, "Token refreshed.", accessToken, newRawRefreshToken, expiresAt, userDto));
+        // Return the same refresh token so the session has a fixed seven-day lifetime.
+        return Ok(new AuthResponseDto(true, "Token refreshed.", accessToken, request.RefreshToken, expiresAt, userDto));
     }
 
     [HttpPost("logout")]
-    public async Task<IActionResult> Logout([FromBody] RefreshTokenRequestDto request)
+    public IActionResult Logout([FromBody] RefreshTokenRequestDto request)
     {
-        var tokenHash = _tokenService.HashToken(request.RefreshToken);
-        var storedToken = await _db.RefreshTokens.FirstOrDefaultAsync(r => r.TokenHash == tokenHash);
-        if (storedToken != null)
-        {
-            storedToken.IsRevoked = true;
-            storedToken.RevokedAt = DateTime.UtcNow;
-            await _db.SaveChangesAsync();
-        }
-        return Ok(new { message = "Logged out successfully." });
+        return Ok(new { message = "Logged out. The client must delete its locally stored tokens." });
+    }
+
+    [Authorize]
+    [HttpPost("logout-all")]
+    public async Task<IActionResult> LogoutAll(CancellationToken cancellationToken)
+    {
+        var claim = User.FindFirstValue(ClaimTypes.NameIdentifier) ?? User.FindFirstValue("sub");
+        if (!int.TryParse(claim, out var userId)) return Unauthorized();
+        await _db.Users.Where(x => x.Id == userId)
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.TokenVersion, x => x.TokenVersion + 1), cancellationToken);
+        return Ok(new { message = "All sessions have been revoked." });
     }
 
     [Authorize]
@@ -377,14 +424,7 @@ public class AuthController : ControllerBase
         user.PasswordHash = _passwordHasher.HashPassword(request.NewPassword);
         user.UpdatedAt = DateTime.UtcNow;
 
-        // Keep the current mobile session usable, but revoke all refresh sessions.
-        // The user will sign in with the new password when the access token expires.
-        var sessions = await _db.RefreshTokens.Where(t => t.UserId == userId && !t.IsRevoked).ToListAsync();
-        foreach (var session in sessions)
-        {
-            session.IsRevoked = true;
-            session.RevokedAt = DateTime.UtcNow;
-        }
+        user.TokenVersion++;
 
         await _db.SaveChangesAsync();
         return Ok(new ResetPasswordResponseDto(true, "Password changed successfully. Please sign in again."));
@@ -392,12 +432,12 @@ public class AuthController : ControllerBase
 
     [Authorize]
     [HttpDelete("account")]
-    public async Task<IActionResult> DeleteAccount()
+    public async Task<IActionResult> DeleteAccount(CancellationToken cancellationToken)
     {
         var claim = User.FindFirstValue(ClaimTypes.NameIdentifier) ?? User.FindFirstValue("sub");
         if (!int.TryParse(claim, out var userId)) return Unauthorized();
 
-        var user = await _db.Users.FirstOrDefaultAsync(u => u.Id == userId);
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.Id == userId, cancellationToken);
         if (user is null) return NotFound();
 
         // Delete explicitly in dependency order. Some deployed databases use
@@ -406,20 +446,39 @@ public class AuthController : ControllerBase
         var strategy = _db.Database.CreateExecutionStrategy();
         await strategy.ExecuteAsync(async () =>
         {
-            await using var transaction = await _db.Database.BeginTransactionAsync();
+            await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken);
 
-            await _db.Alerts.Where(x => x.UserId == userId).ExecuteDeleteAsync();
-            await _db.GlucoseMeasurements.Where(x => x.UserId == userId).ExecuteDeleteAsync();
-            await _db.Sensors.Where(x => x.UserId == userId).ExecuteDeleteAsync();
-            await _db.CgmDevices.Where(x => x.UserId == userId).ExecuteDeleteAsync();
-            await _db.PatientProfiles.Where(x => x.UserId == userId).ExecuteDeleteAsync();
+            // Delete join/dependent rows first. Production databases can have
+            // restrictive FKs even when the current EF model specifies cascade.
+            var ownedAlertIds = _db.Alerts.Where(x => x.UserId == userId).Select(x => x.Id);
+            await _db.AlertRecipients
+                .Where(x => x.UserId == userId || ownedAlertIds.Contains(x.AlertId))
+                .ExecuteDeleteAsync(cancellationToken);
+            await _db.AlertDeliveryHistory.Where(x => ownedAlertIds.Contains(x.AlertId)).ExecuteDeleteAsync(cancellationToken);
+            await _db.AlertQueue.Where(x => ownedAlertIds.Contains(x.AlertId)).ExecuteDeleteAsync(cancellationToken);
+
+            var ownedFamilyIds = _db.Families.Where(x => x.OwnerUserId == userId).Select(x => x.Id);
+            await _db.FamilyMembers
+                .Where(x => x.UserId == userId || ownedFamilyIds.Contains(x.FamilyId))
+                .ExecuteDeleteAsync(cancellationToken);
+            await _db.Families
+                .Where(x => x.OwnerUserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+
+            await _db.Alerts.Where(x => x.UserId == userId).ExecuteDeleteAsync(cancellationToken);
+            await _db.GlucoseMeasurements.Where(x => x.UserId == userId).ExecuteDeleteAsync(cancellationToken);
+            await _db.Sensors.Where(x => x.UserId == userId).ExecuteDeleteAsync(cancellationToken);
+            await _db.CgmDevices.Where(x => x.UserId == userId).ExecuteDeleteAsync(cancellationToken);
+            await _db.PatientProfiles.Where(x => x.UserId == userId).ExecuteDeleteAsync(cancellationToken);
             await _db.PasswordResetTokens
                 .Where(x => x.UserId == userId || x.Email == email)
-                .ExecuteDeleteAsync();
-            await _db.RefreshTokens.Where(x => x.UserId == userId).ExecuteDeleteAsync();
-            await _db.Users.Where(x => x.Id == userId).ExecuteDeleteAsync();
+                .ExecuteDeleteAsync(cancellationToken);
+            await _db.AlertRules.Where(x => x.UserId == userId).ExecuteDeleteAsync(cancellationToken);
+            await _db.NotificationEndpoints.Where(x => x.UserId == userId).ExecuteDeleteAsync(cancellationToken);
+            await _db.DailyGlucoseSummaries.Where(x => x.UserId == userId).ExecuteDeleteAsync(cancellationToken);
+            await _db.Users.Where(x => x.Id == userId).ExecuteDeleteAsync(cancellationToken);
 
-            await transaction.CommitAsync();
+            await transaction.CommitAsync(cancellationToken);
         });
         return NoContent();
     }

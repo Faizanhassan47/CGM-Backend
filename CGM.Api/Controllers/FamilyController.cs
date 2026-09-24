@@ -90,6 +90,23 @@ public class FamilyController(CgmDbContext db, IReferralCodeService referralCode
         return Ok(new { message = "Alert preference updated." });
     }
 
+    [HttpPut("members/{targetUserId:int}/role")]
+    public async Task<IActionResult> Role(int targetUserId, UpdateCareCircleRoleRequest request, CancellationToken ct)
+    {
+        var roles = new[] { "Parent", "Doctor", "Caregiver", "EmergencyContact" };
+        if (!roles.Contains(request.Role, StringComparer.OrdinalIgnoreCase))
+            return BadRequest(new { message = "Role must be Parent, Doctor, Caregiver, or EmergencyContact." });
+        var family = await VisibleFamily(UserId).FirstOrDefaultAsync(ct);
+        if (family is null) return NotFound();
+        if (family.OwnerUserId != UserId) return Forbid();
+        var member = family.Members.FirstOrDefault(m => m.UserId == targetUserId && m.Status == "Active");
+        if (member is null) return NotFound();
+        if (targetUserId == family.OwnerUserId) return BadRequest(new { message = "The owner role cannot be changed." });
+        member.Role = roles.First(r => r.Equals(request.Role, StringComparison.OrdinalIgnoreCase));
+        await db.SaveChangesAsync(ct);
+        return Ok(new { message = "Care-circle role updated.", role = member.Role });
+    }
+
     [HttpPut("thresholds")]
     public async Task<IActionResult> Thresholds(UpdateFamilyThresholdsRequest request, CancellationToken ct)
     {
@@ -134,6 +151,208 @@ public class FamilyController(CgmDbContext db, IReferralCodeService referralCode
         if (family.OwnerUserId == UserId) family.IsActive = false;
         await db.SaveChangesAsync(ct);
         return Ok(new { message = "You left the family." });
+    }
+
+    [HttpPost("notify")]
+    public async Task<IActionResult> Notify(SendNotificationRequest request, CancellationToken ct)
+    {
+        var family = await VisibleFamily(UserId).FirstOrDefaultAsync(ct);
+        if (family is null) return NotFound(new { message = "You do not belong to an active family." });
+        if (family.OwnerUserId != UserId) return Forbid();
+
+        var targetMembers = family.Members.Where(m => m.Status == "Active" && m.UserId != UserId);
+        if (request.Target == "AlertsOn")
+        {
+            targetMembers = targetMembers.Where(m => m.ReceiveAlerts);
+        }
+
+        foreach (var member in targetMembers)
+        {
+            if (member.UserId.HasValue)
+            {
+                db.Alerts.Add(new AlertEntity
+                {
+                    UserId = member.UserId.Value,
+                    AlertType = "Custom",
+                    Title = "Family Notification",
+                    Message = request.Message,
+                    Severity = "Info"
+                });
+            }
+        }
+        await db.SaveChangesAsync(ct);
+        return Ok(new { message = "Notifications sent." });
+    }
+
+    [HttpGet("weekly-report")]
+    public async Task<ActionResult<IReadOnlyList<WeeklyReportItemResponse>>> WeeklyReport(CancellationToken ct)
+    {
+        var family = await VisibleFamily(UserId).FirstOrDefaultAsync(ct);
+        if (family is null) return NotFound(new { message = "You do not belong to an active family." });
+        if (family.OwnerUserId != UserId) return Forbid();
+
+        var memberUserIds = family.Members.Where(m => m.Status == "Active" && m.UserId.HasValue).Select(m => m.UserId.Value).ToList();
+        
+        var sevenDaysAgo = DateTime.UtcNow.AddDays(-7);
+        var alerts = await db.Alerts
+            .Include(a => a.User)
+            .Where(a => memberUserIds.Contains(a.UserId) && a.AlertTime >= sevenDaysAgo)
+            .OrderByDescending(a => a.AlertTime)
+            .Select(a => new WeeklyReportItemResponse(a.UserId, a.User.FullName, a.AlertType, a.GlucoseValue, a.AlertTime))
+            .ToListAsync(ct);
+
+        return Ok(alerts);
+    }
+
+    [HttpGet("members/{targetUserId:int}/report-summary")]
+    public async Task<ActionResult> MemberReportSummary(int targetUserId, [FromQuery] DateTime start, [FromQuery] DateTime end, CancellationToken ct)
+    {
+        var family = await VisibleFamily(UserId).FirstOrDefaultAsync(ct);
+        if (family is null) return NotFound(new { message = "You do not belong to an active family." });
+        var member = family.Members.FirstOrDefault(m => m.UserId == targetUserId && m.Status == "Active");
+        if (member is null) return NotFound(new { message = "Member not found." });
+        
+        var startDate = start.Date;
+        var endDate = end.Date;
+        if (startDate > endDate) (startDate, endDate) = (endDate, startDate);
+
+        var startUtc = DateTime.SpecifyKind(startDate, DateTimeKind.Utc);
+        var endUtc = DateTime.SpecifyKind(endDate.AddDays(1).AddTicks(-1), DateTimeKind.Utc);
+
+        var query = db.GlucoseMeasurements
+            .Where(m => m.UserId == targetUserId && m.MeasurementTime >= startUtc && m.MeasurementTime <= endUtc)
+            .OrderBy(m => m.MeasurementTime);
+
+        var readings = await query.ToListAsync(ct);
+        
+        var patientName = member.User?.FullName ?? "Family Member";
+        var patientEmail = member.User?.Email ?? "";
+        var dateRange = $"{startDate:MMM dd, yyyy} – {endDate:MMM dd, yyyy}";
+
+        if (readings.Count == 0)
+        {
+            readings = await db.GlucoseMeasurements
+                .Where(m => m.UserId == targetUserId && m.GlucoseValue.HasValue)
+                .OrderByDescending(m => m.MeasurementTime)
+                .Take(40)
+                .ToListAsync(ct);
+
+            if (readings.Count > 0)
+            {
+                readings.Reverse();
+                var earliest = readings.First().MeasurementTime;
+                var latest = readings.Last().MeasurementTime;
+                dateRange = $"{earliest:MMM dd, yyyy} – {latest:MMM dd, yyyy}";
+            }
+        }
+
+        var validReadings = readings.Where(r => r.GlucoseValue.HasValue).Select(r => r.GlucoseValue!.Value).ToList();
+        if (validReadings.Count == 0)
+        {
+            return Ok(new DetailedReportDto
+            {
+                UserId = targetUserId,
+                PatientName = patientName,
+                PatientEmail = patientEmail,
+                DateRange = dateRange,
+                StartDate = startDate,
+                EndDate = endDate,
+                GeneratedAt = DateTime.UtcNow,
+                TotalReadings = 0
+            });
+        }
+
+        var total = (decimal)validReadings.Count;
+        var avg = Math.Round(validReadings.Average(), 0);
+        var min = validReadings.Min();
+        var max = validReadings.Max();
+
+        var inRangeCount = validReadings.Count(v => v is >= 70 and <= 180);
+        var aboveRangeCount = validReadings.Count(v => v > 180);
+        var belowRangeCount = validReadings.Count(v => v < 70);
+        var veryHighCount = validReadings.Count(v => v > 250);
+        var veryLowCount = validReadings.Count(v => v < 54);
+
+        var tir = Math.Round((decimal)inRangeCount / total * 100, 1);
+        var tar = Math.Round((decimal)aboveRangeCount / total * 100, 1);
+        var tbr = Math.Round((decimal)belowRangeCount / total * 100, 1);
+        var veryHigh = Math.Round((decimal)veryHighCount / total * 100, 1);
+        var veryLow = Math.Round((decimal)veryLowCount / total * 100, 1);
+
+        var a1c = Math.Round((avg + 46.7m) / 28.7m, 1);
+        var stdDev = 0m;
+        if (validReadings.Count > 1)
+        {
+            var sumSq = validReadings.Sum(v => (v - avg) * (v - avg));
+            stdDev = Math.Round((decimal)Math.Sqrt((double)(sumSq / (validReadings.Count - 1))), 1);
+        }
+        var cv = avg > 0 ? Math.Round((stdDev / avg) * 100, 1) : 0;
+
+        var dailySummaries = readings
+            .Where(r => r.GlucoseValue.HasValue)
+            .GroupBy(r => r.MeasurementTime.Date)
+            .OrderByDescending(g => g.Key)
+            .Select(g =>
+            {
+                var gVals = g.Select(r => r.GlucoseValue!.Value).ToList();
+                var gAvg = Math.Round(gVals.Average(), 0);
+                var gMin = gVals.Min();
+                var gMax = gVals.Max();
+                var gTir = Math.Round((decimal)gVals.Count(v => v is >= 70 and <= 180) / gVals.Count * 100, 0);
+                return new DailyReportBreakdownDto
+                {
+                    DateFormatted = g.Key.ToString("ddd, MMM dd"),
+                    ReadingsCount = gVals.Count,
+                    AvgGlucose = $"{gAvg} mg/dL",
+                    MinGlucose = $"{gMin} mg/dL",
+                    MaxGlucose = $"{gMax} mg/dL",
+                    TimeInRange = $"{gTir}%",
+                    Status = gTir >= 70 ? "Optimal" : (gMin < 70 ? "Low Detected" : "Variable")
+                };
+            })
+            .ToList();
+
+        var recentList = readings
+            .OrderByDescending(r => r.MeasurementTime)
+            .Take(40)
+            .Select(r => new ReportReadingItemDto
+            {
+                Time = r.MeasurementTime,
+                TimeFormatted = r.MeasurementTime.ToLocalTime().ToString("MMM dd, yyyy HH:mm"),
+                Value = r.GlucoseValue ?? 0,
+                Status = (r.GlucoseValue ?? 0) < 70 ? "Low" : ((r.GlucoseValue ?? 0) > 180 ? "High" : "Normal")
+            })
+            .ToList();
+
+        return Ok(new DetailedReportDto
+        {
+            UserId = targetUserId,
+            PatientName = patientName,
+            PatientEmail = patientEmail,
+            DateRange = dateRange,
+            StartDate = startDate,
+            EndDate = endDate,
+            GeneratedAt = DateTime.UtcNow,
+            TotalReadings = validReadings.Count,
+            AvgGlucose = $"{avg} mg/dL",
+            TimeInRange = $"{tir}%",
+            TimeAboveRange = $"{tar}%",
+            TimeBelowRange = $"{tbr}%",
+            TimeVeryHigh = $"{veryHigh}%",
+            TimeVeryLow = $"{veryLow}%",
+            HighestGlucose = $"{max} mg/dL",
+            LowestGlucose = $"{min} mg/dL",
+            EstimatedA1c = $"{a1c}%",
+            GlucoseVariability = $"{cv}%",
+            StandardDeviation = $"{stdDev} mg/dL",
+            TirPercentage = (double)tir,
+            TarPercentage = (double)tar,
+            TbrPercentage = (double)tbr,
+            VeryHighPercentage = (double)veryHigh,
+            VeryLowPercentage = (double)veryLow,
+            DailySummaries = dailySummaries,
+            RecentReadings = recentList
+        });
     }
 
     private IQueryable<FamilyEntity> VisibleFamily(int userId) => db.Families

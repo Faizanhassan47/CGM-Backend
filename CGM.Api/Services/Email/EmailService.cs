@@ -7,6 +7,7 @@ namespace CGM.Api.Services.Email;
 public interface IEmailService
 {
     Task<bool> SendWelcomeEmailAsync(string toEmail, string fullName);
+
     Task<bool> SendPasswordResetEmailAsync(string toEmail, string fullName, string resetToken, string otpCode, DateTime expiresAt);
     Task<bool> SendGlucoseAlertEmailAsync(string toEmail, string recipientName, string patientName, decimal glucoseValue, string unit, decimal threshold, bool isLow);
 }
@@ -22,18 +23,14 @@ public class EmailService : IEmailService
         _logger = logger;
     }
 
-    private string SmtpHost => Required("SMTP_HOST", "Smtp:Host");
+    private string? SmtpHost => Environment.GetEnvironmentVariable("SMTP_HOST") ?? _configuration["Smtp:Host"];
     private int SmtpPort => int.TryParse(Environment.GetEnvironmentVariable("SMTP_PORT") ?? _configuration["Smtp:Port"], out var port) ? port : 465;
     private bool SmtpSsl => bool.TryParse(Environment.GetEnvironmentVariable("SMTP_SSL") ?? _configuration["Smtp:Ssl"], out var ssl) ? ssl : true;
-    private string SmtpUser => Required("SMTP_USER", "Smtp:User");
-    private string SmtpPass => Required("SMTP_PASS", "Smtp:Pass");
-    private string FromEmail => Required("SMTP_FROM_EMAIL", "Smtp:FromEmail");
+    private string? SmtpUser => Environment.GetEnvironmentVariable("SMTP_USER") ?? _configuration["Smtp:User"];
+    private string? SmtpPass => Environment.GetEnvironmentVariable("SMTP_PASS") ?? _configuration["Smtp:Pass"];
+    private string FromEmail => Environment.GetEnvironmentVariable("SMTP_FROM_EMAIL") ?? _configuration["Smtp:FromEmail"] ?? "no-reply@glucotrack.local";
     private string FromName => Environment.GetEnvironmentVariable("SMTP_FROM_NAME") ?? _configuration["Smtp:FromName"] ?? "GlucoTrack CGM Platform";
     private string ResetUrlBase => Environment.GetEnvironmentVariable("APP_RESET_URL") ?? "https://cgm.gms-world.co/reset-password";
-
-    private string Required(string environmentKey, string configurationKey) =>
-        Environment.GetEnvironmentVariable(environmentKey) ?? _configuration[configurationKey]
-        ?? throw new InvalidOperationException($"{environmentKey} is required.");
 
     public async Task<bool> SendWelcomeEmailAsync(string toEmail, string fullName)
     {
@@ -46,13 +43,13 @@ public class EmailService : IEmailService
     <style>
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #F8FAF9; margin: 0; padding: 20px; }}
         .container {{ max-width: 580px; margin: 0 auto; background: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05); border: 1px solid #E6F0EB; }}
-        .header {{ background-color: #0D9488; padding: 32px 24px; text-align: center; }}
+        .header {{ background-color: #01B4F1; padding: 32px 24px; text-align: center; }}
         .header h1 {{ color: #ffffff; margin: 0; font-size: 24px; font-weight: 700; }}
         .header p {{ color: #E6F4EA; margin: 6px 0 0 0; font-size: 14px; }}
         .content {{ padding: 32px 28px; color: #0F172A; line-height: 1.6; }}
         .greeting {{ font-size: 18px; font-weight: 600; margin-bottom: 12px; }}
         .card {{ background: #F0FDFA; border: 1px solid #CCFBF1; border-radius: 12px; padding: 18px; margin: 20px 0; }}
-        .btn {{ display: inline-block; background-color: #0D9488; color: #ffffff !important; text-decoration: none; padding: 14px 28px; border-radius: 10px; font-weight: bold; font-size: 14px; text-align: center; margin-top: 10px; }}
+        .btn {{ display: inline-block; background-color: #01B4F1; color: #ffffff !important; text-decoration: none; padding: 14px 28px; border-radius: 10px; font-weight: bold; font-size: 14px; text-align: center; margin-top: 10px; }}
         .footer {{ background: #F8FAF9; padding: 20px; text-align: center; font-size: 12px; color: #64748B; border-top: 1px solid #E6F0EB; }}
     </style>
 </head>
@@ -67,7 +64,7 @@ public class EmailService : IEmailService
             <p>Welcome to GlucoTrack. Your account has been successfully created and linked to the Continuous Glucose Monitoring platform.</p>
             
             <div class='card'>
-                <h3 style='margin:0 0 8px 0; color:#0D9488; font-size:15px;'>📱 What's Next?</h3>
+                <h3 style='margin:0 0 8px 0; color:#01B4F1; font-size:15px;'>📱 What's Next?</h3>
                 <ul style='margin:0; padding-left:20px; font-size:13px; color:#334155;'>
                     <li>Open the mobile app and complete your patient profile</li>
                     <li>Pair your disposable CGM sensor via Bluetooth Low Energy</li>
@@ -87,8 +84,11 @@ public class EmailService : IEmailService
         return await SendEmailAsync(toEmail, fullName, subject, bodyHtml);
     }
 
+
+
     public async Task<bool> SendPasswordResetEmailAsync(string toEmail, string fullName, string resetToken, string otpCode, DateTime expiresAt)
     {
+        _logger.LogInformation("🔑 [PASSWORD RESET OTP] Target: {Email} | OTP Code: {OtpCode} | Expires: {ExpiresAt:HH:mm:ss} UTC", toEmail, otpCode, expiresAt);
         var subject = "PASSWORD RESET - CGM Patient App";
 
         var textBody = $@"PASSWORD RESET
@@ -157,6 +157,18 @@ If you did not request a password reset, you can safely ignore this email. Your 
 
     private async Task<bool> SendEmailAsync(string toEmail, string toName, string subject, string bodyHtml, string? textBody = null)
     {
+        var host = SmtpHost;
+        var user = SmtpUser;
+        var pass = SmtpPass;
+        var port = SmtpPort;
+
+        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(user) || string.IsNullOrWhiteSpace(pass))
+        {
+            _logger.LogWarning("[DEV/MOCK EMAIL] SMTP credentials not configured. Outgoing email to {ToEmail} ({Subject}):\n{Content}",
+                toEmail, subject, textBody ?? bodyHtml);
+            return true;
+        }
+
         try
         {
             var message = new MimeMessage();
@@ -176,12 +188,12 @@ If you did not request a password reset, you can safely ignore this email. Your 
             // Accept certificate if needed or use SSL
             client.ServerCertificateValidationCallback = (s, c, h, e) => true;
 
-            var secureSocket = SmtpPort == 465 
-                ? SecureSocketOptions.SslOnConnect 
+            var secureSocket = port == 465
+                ? SecureSocketOptions.SslOnConnect
                 : SecureSocketOptions.StartTls;
 
-            await client.ConnectAsync(SmtpHost, SmtpPort, secureSocket);
-            await client.AuthenticateAsync(SmtpUser, SmtpPass);
+            await client.ConnectAsync(host, port, secureSocket);
+            await client.AuthenticateAsync(user, pass);
             await client.SendAsync(message);
             await client.DisconnectAsync(true);
 
@@ -190,7 +202,7 @@ If you did not request a password reset, you can safely ignore this email. Your 
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to send email '{Subject}' to {ToEmail} via {Host}:{Port}", subject, toEmail, SmtpHost, SmtpPort);
+            _logger.LogError(ex, "Failed to send email '{Subject}' to {ToEmail} via {Host}:{Port}", subject, toEmail, host ?? "unconfigured", port);
             return false;
         }
     }

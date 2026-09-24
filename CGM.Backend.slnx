@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="CGM.Api/CGM.Api.csproj" />
+  <Project Path="CGM.Api.Tests/CGM.Api.Tests.csproj" />
 </Solution>

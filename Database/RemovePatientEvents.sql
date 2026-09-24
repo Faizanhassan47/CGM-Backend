@@ -1,0 +1,7 @@
+SET XACT_ABORT ON;
+BEGIN TRANSACTION;
+
+IF OBJECT_ID('dbo.PatientEvents', 'U') IS NOT NULL
+    DROP TABLE dbo.PatientEvents;
+
+COMMIT TRANSACTION;

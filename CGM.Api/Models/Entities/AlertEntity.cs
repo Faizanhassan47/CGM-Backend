@@ -13,7 +13,6 @@ public class AlertEntity
     public int UserId { get; set; }
 
     public int? SensorId { get; set; }
-    public long? MeasurementId { get; set; }
 
     [Required]
     [MaxLength(50)]
@@ -48,7 +47,5 @@ public class AlertEntity
     [ForeignKey(nameof(SensorId))]
     public virtual SensorEntity? Sensor { get; set; }
 
-    [ForeignKey(nameof(MeasurementId))]
-    public virtual GlucoseMeasurementEntity? Measurement { get; set; }
     public virtual ICollection<AlertRecipientEntity> Recipients { get; set; } = new List<AlertRecipientEntity>();
 }

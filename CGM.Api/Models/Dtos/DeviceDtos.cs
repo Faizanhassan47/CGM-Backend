@@ -45,7 +45,5 @@ public record SensorInfoDto(
     string Status,
     DateTime? StartedAt,
     DateTime? ActivatedAt,
-    DateTime? ExpiresAt,
-    DateTime? LastReadingAt,
-    int? LatestSequenceNumber
+    DateTime? LastReadingAt
 );

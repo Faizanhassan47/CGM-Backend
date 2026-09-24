@@ -6,32 +6,19 @@ namespace CGM.Api.Models.Entities;
 [Table("GlucoseMeasurements", Schema = "dbo")]
 public class GlucoseMeasurementEntity
 {
-    [Key]
-    public long Id { get; set; }
-
     [Required]
     public int UserId { get; set; }
 
     [Required]
     public int SensorId { get; set; }
 
-    [Required]
-    public int SequenceNumber { get; set; }
+    public int? DeviceId { get; set; }
 
     [Column(TypeName = "decimal(10,2)")]
     public decimal? GlucoseValue { get; set; }
 
-    [MaxLength(10)]
-    public string? GlucoseUnit { get; set; }
-
     [Required]
     public DateTime MeasurementTime { get; set; }
-
-    [MaxLength(30)]
-    public string? Trend { get; set; }
-
-    [MaxLength(30)]
-    public string? GlucoseStatus { get; set; }
 
     public int? BatteryVoltageMv { get; set; }
 
@@ -50,4 +37,7 @@ public class GlucoseMeasurementEntity
 
     [ForeignKey(nameof(SensorId))]
     public virtual SensorEntity Sensor { get; set; } = null!;
+
+    [ForeignKey(nameof(DeviceId))]
+    public virtual CgmDeviceEntity? Device { get; set; }
 }

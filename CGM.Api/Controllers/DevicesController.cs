@@ -9,7 +9,7 @@ using CGM.Api.Models.Entities;
 namespace CGM.Api.Controllers;
 
 [ApiController]
-// [Authorize] // Temporarily disabled for simulator testing
+[Authorize]
 [Route("api/[controller]")]
 public class DevicesController : ControllerBase
 {
@@ -23,25 +23,20 @@ public class DevicesController : ControllerBase
     private int GetCurrentUserId()
     {
         var claim = User.FindFirstValue(ClaimTypes.NameIdentifier) ?? User.FindFirstValue("sub");
-        if (int.TryParse(claim, out var id)) return id;
+        return int.TryParse(claim, out var id)
+            ? id
+            : throw new UnauthorizedAccessException("User identifier claim is missing.");
+    }
 
-        // DEVELOPMENT BYPASS: If no token provided, auto-create and use a dummy user
-        var devUser = _db.Users.FirstOrDefault();
-        if (devUser == null)
-        {
-            devUser = new User
-            {
-                FullName = "Dev User",
-                Email = "dev@example.com",
-                PasswordHash = "dummy",
-                AuthProvider = "Email",
-                IsActive = true,
-                CreatedAt = DateTime.UtcNow
-            };
-            _db.Users.Add(devUser);
-            _db.SaveChanges();
-        }
-        return devUser.Id;
+    [HttpGet("{id:int}")]
+    public async Task<ActionResult<DeviceInfoDto>> GetDevice(int id)
+    {
+        var userId = GetCurrentUserId();
+        var device = await _db.CgmDevices.FirstOrDefaultAsync(d => d.Id == id);
+        if (device is null) return NotFound();
+        if (device.UserId != userId) return Forbid();
+
+        return Ok(ToDto(device));
     }
 
     [HttpGet]
@@ -79,7 +74,7 @@ public class DevicesController : ControllerBase
         {
             device = await _db.CgmDevices.FirstOrDefaultAsync(d => d.SerialNumber == request.SerialNumber);
             if (device is not null && device.UserId != userId)
-                return Conflict(new { message = "This device is already registered to another account." });
+                return Forbid();
         }
 
         if (device == null)
@@ -134,12 +129,14 @@ public class DevicesController : ControllerBase
         ));
     }
 
-    [HttpPut("{id}/status")]
+    [HttpPut("{id:int}")]
+    [HttpPut("{id:int}/status")]
     public async Task<IActionResult> UpdateStatus(int id, [FromBody] UpdateDeviceStatusDto request)
     {
         var userId = GetCurrentUserId();
-        var device = await _db.CgmDevices.FirstOrDefaultAsync(d => d.Id == id && d.UserId == userId);
-        if (device == null) return NotFound();
+        var device = await _db.CgmDevices.FirstOrDefaultAsync(d => d.Id == id);
+        if (device is null) return NotFound();
+        if (device.UserId != userId) return Forbid();
 
         device.ConnectionStatus = request.ConnectionStatus;
         if (request.BatteryVoltageMv.HasValue) device.BatteryVoltageMv = request.BatteryVoltageMv;
@@ -155,8 +152,9 @@ public class DevicesController : ControllerBase
     public async Task<IActionResult> RemoveDevice(int id)
     {
         var userId = GetCurrentUserId();
-        var device = await _db.CgmDevices.FirstOrDefaultAsync(d => d.Id == id && d.UserId == userId);
-        if (device == null) return NotFound();
+        var device = await _db.CgmDevices.FirstOrDefaultAsync(d => d.Id == id);
+        if (device is null) return NotFound();
+        if (device.UserId != userId) return Forbid();
 
         device.IsActive = false;
         device.ConnectionStatus = "Disconnected";
@@ -164,4 +162,17 @@ public class DevicesController : ControllerBase
         await _db.SaveChangesAsync();
         return NoContent();
     }
+
+    private static DeviceInfoDto ToDto(CgmDeviceEntity device) => new(
+        device.Id,
+        device.DeviceName ?? "CGM Device",
+        device.DeviceType ?? "Disposable",
+        device.DeviceModel ?? "G-AA",
+        device.SerialNumber,
+        device.BleDeviceName,
+        device.FirmwareVersion,
+        device.BatteryVoltageMv,
+        device.BatteryPercentage,
+        device.ConnectionStatus,
+        device.LastConnectedAt);
 }

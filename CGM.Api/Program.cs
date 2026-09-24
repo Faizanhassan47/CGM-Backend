@@ -6,6 +6,7 @@ using Microsoft.IdentityModel.Tokens;
 using CGM.Api.Data;
 using CGM.Api.Services;
 using System.Threading.RateLimiting;
+using CGM.Api.Middleware;
 
 // 1. Load .env Configuration
 var rootDir = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), ".."));
@@ -21,17 +22,28 @@ else if (File.Exists(".env"))
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Logging.ClearProviders();
+builder.Logging.AddSimpleConsole(options =>
+{
+    options.IncludeScopes = false;
+    options.SingleLine = true;
+    options.TimestampFormat = "[HH:mm:ss] ";
+});
+
 // 2. Configure Database Connection String from .env / AppSettings
 var connectionString = Environment.GetEnvironmentVariable("DB_CONNECTION_STRING")
     ?? builder.Configuration.GetConnectionString("DefaultConnection")
     ?? throw new InvalidOperationException("DB_CONNECTION_STRING is required.");
 
-builder.Services.AddDbContext<CgmDbContext>(options =>
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddSingleton<AuditSaveChangesInterceptor>();
+builder.Services.AddDbContext<CgmDbContext>((services, options) =>
 {
     options.UseSqlServer(connectionString, sqlOptions =>
     {
         sqlOptions.EnableRetryOnFailure(maxRetryCount: 3, maxRetryDelay: TimeSpan.FromSeconds(5), errorNumbersToAdd: null);
     });
+    options.AddInterceptors(services.GetRequiredService<AuditSaveChangesInterceptor>());
 });
 
 // 3. Register Custom Services
@@ -39,7 +51,17 @@ builder.Services.AddScoped<IPasswordHasher, PasswordHasher>();
 builder.Services.AddScoped<ITokenService, TokenService>();
 builder.Services.AddScoped<IReferralCodeService, ReferralCodeService>();
 builder.Services.AddScoped<IGlucoseAlertService, GlucoseAlertService>();
+builder.Services.AddHttpClient("notifications", client => client.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddScoped<IExternalNotificationSender, ExternalNotificationSender>();
+builder.Services.AddHostedService<AlertNotificationWorker>();
+builder.Services.AddHostedService<OperationalAlertWorker>();
+builder.Services.AddHostedService<DailySummaryWorker>();
 builder.Services.AddScoped<CGM.Api.Services.Email.IEmailService, CGM.Api.Services.Email.EmailService>();
+builder.Services.AddSingleton<OperationalMetrics>();
+
+// Caching & Real-time WebSockets
+builder.Services.AddMemoryCache();
+builder.Services.AddSignalR();
 
 // 4. Configure JWT Authentication
 var jwtSecret = Environment.GetEnvironmentVariable("JWT_SECRET")
@@ -104,7 +126,8 @@ builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 
-app.UseExceptionHandler();
+app.UseMiddleware<RequestTelemetryMiddleware>();
+app.UseMiddleware<GlobalExceptionMiddleware>();
 
 // 7. Enable Middleware
 if (app.Environment.IsDevelopment())
@@ -127,6 +150,7 @@ app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();
+app.MapHub<CGM.Api.Hubs.GlucoseHub>("/hubs/glucose");
 
 // 8. Seed Default Test User Data
 if (app.Environment.IsDevelopment())
@@ -138,3 +162,5 @@ if (app.Environment.IsDevelopment())
 }
 
 app.Run();
+
+public partial class Program { }

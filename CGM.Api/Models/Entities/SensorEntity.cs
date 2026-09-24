@@ -24,15 +24,10 @@ public class SensorEntity
 
     public DateTime? StartedAt { get; set; }
     public DateTime? ActivatedAt { get; set; }
-    public DateTime? ExpiresAt { get; set; }
     public DateTime? LastReadingAt { get; set; }
 
-    public int? LatestSequenceNumber { get; set; }
 
     public bool IsActive { get; set; } = true;
-
-    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-    public DateTime? UpdatedAt { get; set; }
 
     [ForeignKey(nameof(UserId))]
     public virtual User User { get; set; } = null!;

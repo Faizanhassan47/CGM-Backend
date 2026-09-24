@@ -1,54 +1,26 @@
+using CGM.Api.Data;
+using CGM.Api.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
-using CGM.Api.Data;
-
 namespace CGM.Api.Controllers;
-
-[ApiController]
-[Route("api/[controller]")]
-public class HealthController : ControllerBase
+[ApiController,Route("api/[controller]")]
+public sealed class HealthController(CgmDbContext db,OperationalMetrics metrics):ControllerBase
 {
-    private readonly CgmDbContext _db;
-
-    public HealthController(CgmDbContext db)
-    {
-        _db = db;
-    }
-
-    [HttpGet("db-check")]
-    public async Task<IActionResult> CheckDatabase()
+    [HttpGet("/health")]
+    [HttpGet]
+    public async Task<IActionResult> Health(CancellationToken ct)
     {
         try
         {
-            var canConnect = await _db.Database.CanConnectAsync();
-            if (!canConnect)
-            {
-                return StatusCode(500, new { success = false, message = "Cannot connect to SQL Server database." });
-            }
-
-            var usersCount = await _db.Users.CountAsync();
-            var devicesCount = await _db.CgmDevices.CountAsync();
-            var sensorsCount = await _db.Sensors.CountAsync();
-            var readingsCount = await _db.GlucoseMeasurements.CountAsync();
-
-            return Ok(new
-            {
-                success = true,
-                database = "CGM",
-                server = "Faizan",
-                status = "Connected",
-                counts = new
-                {
-                    users = usersCount,
-                    devices = devicesCount,
-                    sensors = sensorsCount,
-                    measurements = readingsCount
-                }
-            });
+            if(!await db.Database.CanConnectAsync(ct))return StatusCode(503,new{api="healthy",database="unhealthy",queue="unknown",timestamp=DateTimeOffset.UtcNow});
+            var failed=await db.AlertQueue.CountAsync(x=>x.Status=="Failed",ct);
+            var pending=await db.AlertQueue.CountAsync(x=>x.Status=="Pending"||x.Status=="Processing",ct);
+            var heartbeat=metrics.WorkerHeartbeatUtc;
+            var queueHealth=failed>100||heartbeat.HasValue&&heartbeat<DateTime.UtcNow.AddMinutes(-2)?"degraded":"healthy";
+            return Ok(new{api="healthy",database="healthy",queue=queueHealth,pendingAlerts=pending,failedAlerts=failed,notificationWorkerHeartbeatUtc=heartbeat,timestamp=DateTimeOffset.UtcNow});
         }
-        catch (Exception ex)
-        {
-            return StatusCode(500, new { success = false, error = ex.Message });
-        }
+        catch(Exception){return StatusCode(503,new{api="healthy",database="unhealthy",queue="unknown",timestamp=DateTimeOffset.UtcNow});}
     }
+    [HttpGet("/metrics")]
+    public IActionResult Metrics()=>Ok(metrics.Snapshot());
 }

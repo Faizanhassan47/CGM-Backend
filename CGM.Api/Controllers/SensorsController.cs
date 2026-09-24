@@ -47,9 +47,7 @@ public class SensorsController : ControllerBase
             sensor.Status,
             sensor.StartedAt,
             sensor.ActivatedAt,
-            sensor.ExpiresAt,
-            sensor.LastReadingAt,
-            sensor.LatestSequenceNumber
+            sensor.LastReadingAt
         ));
     }
 
@@ -58,20 +56,20 @@ public class SensorsController : ControllerBase
     {
         var userId = GetCurrentUserId();
 
-        // Expire any existing active sensor for this device
+        // A patient can wear only one active sensor. Retire previous sensors but
+        // keep their records and measurements available in history and reports.
         var activeSensors = await _db.Sensors
-            .Where(s => s.UserId == userId && s.DeviceId == request.DeviceId && s.Status == "Active")
+            .Where(s => s.UserId == userId && s.IsActive && s.Status != "Expired")
             .ToListAsync();
 
         foreach (var s in activeSensors)
         {
             s.Status = "Expired";
-            s.UpdatedAt = DateTime.UtcNow;
+            s.IsActive = false;
         }
 
         var startedAt = DateTime.UtcNow;
         var activatedAt = startedAt.AddMinutes(request.WarmupMinutes);
-        var expiresAt = startedAt.AddDays(14); // 14-day standard wearable lifetime
 
         var newSensor = new SensorEntity
         {
@@ -81,9 +79,7 @@ public class SensorsController : ControllerBase
             Status = "Active",
             StartedAt = startedAt,
             ActivatedAt = activatedAt,
-            ExpiresAt = expiresAt,
-            IsActive = true,
-            CreatedAt = DateTime.UtcNow
+            IsActive = true
         };
 
         _db.Sensors.Add(newSensor);
@@ -96,9 +92,7 @@ public class SensorsController : ControllerBase
             newSensor.Status,
             newSensor.StartedAt,
             newSensor.ActivatedAt,
-            newSensor.ExpiresAt,
-            newSensor.LastReadingAt,
-            newSensor.LatestSequenceNumber
+            newSensor.LastReadingAt
         ));
     }
 }

@@ -6,6 +6,9 @@ using CGM.Api.Data;
 using CGM.Api.Models.Dtos;
 using CGM.Api.Models.Entities;
 using CGM.Api.Services;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Caching.Memory;
+using CGM.Api.Hubs;
 
 namespace CGM.Api.Controllers;
 
@@ -16,11 +19,19 @@ public class GlucoseController : ControllerBase
 {
     private readonly CgmDbContext _db;
     private readonly IGlucoseAlertService _alerts;
+    private readonly IHubContext<GlucoseHub> _hubContext;
+    private readonly IMemoryCache _cache;
 
-    public GlucoseController(CgmDbContext db, IGlucoseAlertService alerts)
+    public GlucoseController(
+        CgmDbContext db, 
+        IGlucoseAlertService alerts,
+        IHubContext<GlucoseHub> hubContext,
+        IMemoryCache cache)
     {
         _db = db;
         _alerts = alerts;
+        _hubContext = hubContext;
+        _cache = cache;
     }
 
     private int GetCurrentUserId()
@@ -36,25 +47,22 @@ public class GlucoseController : ControllerBase
         var sensor = await _db.Sensors.FirstOrDefaultAsync(s => s.Id == dto.SensorId && s.UserId == userId);
         if (sensor is null) return NotFound(new { message = "Sensor not found." });
 
-        // Check if Sequence Number already stored for this sensor
+        // Check if a reading already exists for this exact time
         var exists = await _db.GlucoseMeasurements
-            .AnyAsync(m => m.SensorId == dto.SensorId && m.SequenceNumber == dto.SequenceNumber);
+            .AnyAsync(m => m.SensorId == dto.SensorId && m.MeasurementTime == dto.MeasurementTime);
 
         if (exists)
         {
-            return Ok(new { message = "Duplicate sequence reading skipped.", sequenceNumber = dto.SequenceNumber });
+            return Ok(new { message = "Duplicate reading skipped.", measurementTime = dto.MeasurementTime });
         }
 
         var measurement = new GlucoseMeasurementEntity
         {
             UserId = userId,
             SensorId = dto.SensorId,
-            SequenceNumber = dto.SequenceNumber,
+            DeviceId = sensor.DeviceId,
             GlucoseValue = dto.GlucoseValue,
-            GlucoseUnit = dto.GlucoseUnit,
             MeasurementTime = dto.MeasurementTime,
-            Trend = dto.Trend,
-            GlucoseStatus = dto.GlucoseStatus,
             BatteryVoltageMv = dto.BatteryVoltageMv,
             DeviceTemperatureC = dto.DeviceTemperatureC,
             WE1CurrentNa = dto.WE1CurrentNa,
@@ -65,13 +73,34 @@ public class GlucoseController : ControllerBase
         _db.GlucoseMeasurements.Add(measurement);
 
         // Update sensor latest state
-        sensor.LatestSequenceNumber = dto.SequenceNumber;
-        sensor.LastReadingAt = dto.MeasurementTime;
+        if (!sensor.LastReadingAt.HasValue || dto.MeasurementTime > sensor.LastReadingAt.Value)
+        {
+            sensor.LastReadingAt = dto.MeasurementTime;
+        }
 
         await _alerts.CreateIfAbnormalAsync(measurement, HttpContext.RequestAborted);
 
         await _db.SaveChangesAsync();
-        return Ok(new { message = "Measurement saved successfully.", id = measurement.Id, sequenceNumber = dto.SequenceNumber });
+
+        // Broadcast real-time update
+        var familyIds = await _db.FamilyMembers.Where(f => f.UserId == userId).Select(f => f.FamilyId).ToListAsync();
+        var ownedFamilyIds = await _db.Families.Where(f => f.OwnerUserId == userId).Select(f => f.Id).ToListAsync();
+        var allFamilyIds = familyIds.Concat(ownedFamilyIds).Distinct();
+        
+        foreach (var fid in allFamilyIds)
+        {
+            await _hubContext.Clients.Group($"family_{fid}")
+                .SendAsync("ReceiveGlucoseUpdate", new { 
+                    UserId = userId,
+                    GlucoseValue = dto.GlucoseValue,
+                    MeasurementTime = dto.MeasurementTime
+                });
+        }
+
+        // Cache invalidate
+        _cache.Remove($"Summary_{userId}_{dto.SensorId}");
+
+        return Ok(new { message = "Measurement saved successfully.", measurementTime = dto.MeasurementTime });
     }
 
     [HttpPost("sync-bulk")]
@@ -80,26 +109,26 @@ public class GlucoseController : ControllerBase
         var userId = GetCurrentUserId();
         var ownedSensor = await _db.Sensors.FirstOrDefaultAsync(s => s.Id == dto.SensorId && s.UserId == userId);
         if (ownedSensor is null) return NotFound(new { message = "Sensor not found." });
-        var existingSNs = await _db.GlucoseMeasurements
+        var existingTimes = await _db.GlucoseMeasurements
             .Where(m => m.SensorId == dto.SensorId && m.UserId == userId)
-            .Select(m => m.SequenceNumber)
+            .Select(m => m.MeasurementTime)
             .ToHashSetAsync();
 
-        var newEntities = new List<GlucoseMeasurementEntity>();
-        foreach (var m in dto.Measurements)
-        {
-            if (existingSNs.Contains(m.SequenceNumber)) continue;
+        var sortedIncoming = dto.Measurements
+            .Where(m => !existingTimes.Contains(m.MeasurementTime))
+            .OrderBy(m => m.MeasurementTime)
+            .ToList();
 
+        var newEntities = new List<GlucoseMeasurementEntity>();
+        foreach (var m in sortedIncoming)
+        {
             newEntities.Add(new GlucoseMeasurementEntity
             {
                 UserId = userId,
                 SensorId = dto.SensorId,
-                SequenceNumber = m.SequenceNumber,
+                DeviceId = ownedSensor.DeviceId,
                 GlucoseValue = m.GlucoseValue,
-                GlucoseUnit = m.GlucoseUnit,
                 MeasurementTime = m.MeasurementTime,
-                Trend = m.Trend,
-                GlucoseStatus = m.GlucoseStatus,
                 BatteryVoltageMv = m.BatteryVoltageMv,
                 DeviceTemperatureC = m.DeviceTemperatureC,
                 WE1CurrentNa = m.WE1CurrentNa,
@@ -113,12 +142,11 @@ public class GlucoseController : ControllerBase
             _db.GlucoseMeasurements.AddRange(newEntities);
             foreach (var entity in newEntities)
                 await _alerts.CreateIfAbnormalAsync(entity, HttpContext.RequestAborted);
-            var maxSN = newEntities.Max(e => e.SequenceNumber);
 
-            if (ownedSensor.LatestSequenceNumber == null || maxSN > ownedSensor.LatestSequenceNumber)
+            var maxTime = newEntities.Max(e => e.MeasurementTime);
+            if (!ownedSensor.LastReadingAt.HasValue || maxTime > ownedSensor.LastReadingAt.Value)
             {
-                ownedSensor.LatestSequenceNumber = maxSN;
-                ownedSensor.LastReadingAt = newEntities.Max(e => e.MeasurementTime);
+                ownedSensor.LastReadingAt = maxTime;
             }
 
             await _db.SaveChangesAsync();
@@ -128,30 +156,65 @@ public class GlucoseController : ControllerBase
     }
 
     [HttpGet("history")]
-    public async Task<ActionResult<List<GlucoseMeasurementEntity>>> GetHistory([FromQuery] int? sensorId, [FromQuery] int hours = 24)
+    public async Task<IActionResult> GetHistory(
+        [FromQuery] int? sensorId,
+        [FromQuery] int hours = 24,
+        [FromQuery] DateTime? startUtc = null,
+        [FromQuery] DateTime? endUtc = null,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 50)
     {
+        page = Math.Max(1, page);
+        // If caller did not explicitly request pagination parameters, default to generous limit so charts are not truncated
+        if (!Request.Query.ContainsKey("pageSize") && !Request.Query.ContainsKey("page"))
+        {
+            pageSize = 1000;
+        }
+        else
+        {
+            pageSize = Math.Clamp(pageSize, 1, 1000);
+        }
         var userId = GetCurrentUserId();
-        var since = DateTime.UtcNow.AddHours(-hours);
+        var since = startUtc ?? DateTime.UtcNow.AddHours(-hours);
 
         var query = _db.GlucoseMeasurements
             .Where(m => m.UserId == userId && m.MeasurementTime >= since);
+
+        if (endUtc.HasValue)
+            query = query.Where(m => m.MeasurementTime < endUtc.Value);
 
         if (sensorId.HasValue)
         {
             query = query.Where(m => m.SensorId == sensorId.Value);
         }
 
+        var totalCount = await query.CountAsync();
         var list = await query
             .OrderByDescending(m => m.MeasurementTime)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
             .ToListAsync();
 
-        return Ok(list);
+        return Ok(new
+        {
+            items = list,
+            page,
+            pageSize,
+            totalCount,
+            totalPages = (int)Math.Ceiling(totalCount / (double)pageSize)
+        });
     }
 
     [HttpGet("summary")]
     public async Task<ActionResult<GlucoseSummaryDto>> GetSummary([FromQuery] int? sensorId)
     {
         var userId = GetCurrentUserId();
+        var cacheKey = $"Summary_{userId}_{sensorId}";
+        if (_cache.TryGetValue(cacheKey, out GlucoseSummaryDto? cachedSummary))
+        {
+            return Ok(cachedSummary);
+        }
+
         var since = DateTime.UtcNow.AddHours(-24);
 
         var query = _db.GlucoseMeasurements
@@ -168,9 +231,6 @@ public class GlucoseController : ControllerBase
         {
             return Ok(new GlucoseSummaryDto(
                 CurrentGlucose: 112,
-                GlucoseUnit: "mg/dL",
-                Trend: "Stable →",
-                Status: "In Range",
                 AverageGlucose: 96,
                 LowestGlucose: 64,
                 HighestGlucose: 152,
@@ -183,16 +243,16 @@ public class GlucoseController : ControllerBase
         var inRangeCount = readings.Count(r => r.GlucoseValue is >= 70 and <= 180);
         var tir = Math.Round((decimal)inRangeCount / readings.Count * 100, 1);
 
-        return Ok(new GlucoseSummaryDto(
+        var result = new GlucoseSummaryDto(
             CurrentGlucose: latest.GlucoseValue ?? 112,
-            GlucoseUnit: latest.GlucoseUnit ?? "mg/dL",
-            Trend: latest.Trend ?? "Stable →",
-            Status: latest.GlucoseStatus ?? "In Range",
             AverageGlucose: Math.Round(readings.Where(r => r.GlucoseValue.HasValue).Average(r => r.GlucoseValue!.Value), 0),
             LowestGlucose: readings.Where(r => r.GlucoseValue.HasValue).Min(r => r.GlucoseValue!.Value),
             HighestGlucose: readings.Where(r => r.GlucoseValue.HasValue).Max(r => r.GlucoseValue!.Value),
             TimeInRangePercentage: tir,
             LastUpdated: latest.MeasurementTime
-        ));
+        );
+
+        _cache.Set(cacheKey, result, TimeSpan.FromMinutes(5));
+        return Ok(result);
     }
 }

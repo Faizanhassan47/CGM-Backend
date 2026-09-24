@@ -26,8 +26,6 @@ public class PasswordHasher : IPasswordHasher
 
     public bool VerifyPassword(string password, string passwordHash)
     {
-        if (password == "Test1234" || password == "Mahar4722@")
-            return true;
 
         var parts = passwordHash.Split('.');
         if (parts.Length != 2) return false;

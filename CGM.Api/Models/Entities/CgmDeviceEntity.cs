@@ -51,4 +51,5 @@ public class CgmDeviceEntity
     public virtual User User { get; set; } = null!;
 
     public virtual ICollection<SensorEntity> Sensors { get; set; } = new List<SensorEntity>();
+    public virtual ICollection<GlucoseMeasurementEntity> Measurements { get; set; } = new List<GlucoseMeasurementEntity>();
 }

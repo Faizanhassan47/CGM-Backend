@@ -3,7 +3,7 @@ using System.ComponentModel.DataAnnotations.Schema;
 
 namespace CGM.Api.Models.Entities;
 
-[Table("PasswordResetTokens", Schema = "dbo")]
+[Table("PasswordResetRequests", Schema = "dbo")]
 public class PasswordResetTokenEntity
 {
     [Key]
@@ -20,7 +20,7 @@ public class PasswordResetTokenEntity
     public string Token { get; set; } = string.Empty;
 
     [Required]
-    [MaxLength(10)]
+    [MaxLength(128)]
     public string OtpCode { get; set; } = string.Empty;
 
     public DateTime ExpiresAt { get; set; }
