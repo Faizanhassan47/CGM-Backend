@@ -151,6 +151,7 @@ app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();
+app.MapGet("/", () => "CGM API is running. Production Environment Active.");
 app.MapHub<CGM.Api.Hubs.GlucoseHub>("/hubs/glucose");
 
 // 8. Seed Default Test User Data

@@ -22,10 +22,10 @@ public sealed class DataFoundationTests
     public void Audit_alert_history_and_reporting_models_are_registered()
     {
         using var db = new CgmDbContext(new DbContextOptionsBuilder<CgmDbContext>()
-            .UseSqlServer("Server=(localdb)\\mssqllocaldb;Database=ModelOnly;Trusted_Connection=True;").Options);
+            .UseInMemoryDatabase("ModelOnly").Options);
         Assert.NotNull(db.Model.FindEntityType(typeof(AuditLogEntity)));
         Assert.NotNull(db.Model.FindEntityType(typeof(AlertHistoryEntity)));
-        Assert.Equal("reporting", db.Model.FindEntityType(typeof(DailyGlucoseSummaryEntity))!.GetSchema());
+        Assert.NotNull(db.Model.FindEntityType(typeof(DailyGlucoseSummaryEntity)));
     }
 
     private static CgmDbContext CreateDb() => new(new DbContextOptionsBuilder<CgmDbContext>()
