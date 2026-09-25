@@ -39,8 +39,9 @@ builder.Services.AddHttpContextAccessor();
 builder.Services.AddSingleton<AuditSaveChangesInterceptor>();
 builder.Services.AddDbContext<CgmDbContext>((services, options) =>
 {
-    options.UseSqlServer(connectionString, sqlOptions =>
+    options.UseMySql(connectionString, new MySqlServerVersion(new Version(8, 0, 30)), sqlOptions =>
     {
+        sqlOptions.SchemaBehavior(Pomelo.EntityFrameworkCore.MySql.Infrastructure.MySqlSchemaBehavior.Ignore);
         sqlOptions.EnableRetryOnFailure(maxRetryCount: 3, maxRetryDelay: TimeSpan.FromSeconds(5), errorNumbersToAdd: null);
     });
     options.AddInterceptors(services.GetRequiredService<AuditSaveChangesInterceptor>());
